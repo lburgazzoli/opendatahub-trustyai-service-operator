@@ -477,6 +477,40 @@ def cmd_crd_validate(crd_paths, cr_paths):
     return violations
 
 
+def cmd_kc_report(args):
+    """Summarize a kubeconform JSON report.
+
+    Usage: kc-report FILE [allowed version/kind ...]
+
+    statusInvalid and statusError are failures unless the (version, kind)
+    pair is explicitly allowlisted as an external CRD-backed kind we render
+    without a schema for. An unknown kind is the typo signal: kubeconform
+    reports "could not find schema" for both real CRD kinds and misspelled
+    built-ins, so the allowlist separates them.
+    """
+    if not args:
+        print("usage: manifest_contract.py kc-report FILE [allowed version/kind ...]", file=sys.stderr)
+        return 2
+    with open(args[0], encoding="utf-8") as handle:
+        data = json.load(handle)
+    allowed = set(args[1:])
+    violations = 0
+    for r in data.get("resources", []):
+        if r.get("status") == "statusInvalid":
+            fail(f"{r.get('kind')}/{r.get('name')}: {r.get('msg', 'schema violation')}")
+            violations += 1
+        elif r.get("status") in ("statusError",):
+            key = f"{r.get('version', '')}/{r.get('kind')}"
+            if key not in allowed:
+                fail(
+                    f"{r.get('kind')}/{r.get('name')} ({r.get('version')}): "
+                    f"{r.get('msg', '')} — not a known schema and not in the external-kind "
+                    f"allowlist; likely an apiVersion/kind typo"
+                )
+                violations += 1
+    return violations
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -505,6 +539,8 @@ def main(argv):
             return 2
         split = args.index("--")
         violations = cmd_crd_validate(args[:split], args[split + 1:])
+    elif cmd == "kc-report":
+        violations = cmd_kc_report(args)
     else:
         print(f"unknown subcommand: {cmd}", file=sys.stderr)
         return 2

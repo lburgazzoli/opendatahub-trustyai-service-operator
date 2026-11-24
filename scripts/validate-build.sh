@@ -209,13 +209,32 @@ check_dockerfile_copies() {
       case "$src" in
         /*) continue ;; # absolute path inside a stage
       esac
-      if ! compgen -G "$context_dir/$src" >/dev/null; then
+      if ! glob_exists "$context_dir/$src"; then
         bad "$dockerfile: COPY source '$src' does not exist in the build context"
         failures=$((failures + 1))
       fi
     done
   done < <(grep -E '^(COPY|ADD)[[:space:]]' "$context_dir/$dockerfile" || true)
   return "$failures"
+}
+
+# True when a (possibly globbed) path matches at least one file. Literal paths
+# are tested with -e (nullglob does not drop non-matching literals); globs
+# are expanded with nullglob so no-match yields an empty list.
+glob_exists() {
+  case "$1" in
+    *[\*\?\[]*)
+      local matches=()
+      shopt -s nullglob
+      # shellcheck disable=SC2206
+      matches=($1)
+      shopt -u nullglob
+      [ "${#matches[@]}" -gt 0 ]
+      ;;
+    *)
+      [ -e "$1" ]
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -296,46 +315,29 @@ mode_manifests() {
     ok "all vars substituted"
   fi
 
-  log "manifests: kubeconform typo guard (a skipped built-in kind is a typo)"
-  local f status bad_kinds
+  log "manifests: kubeconform schema validation + typo guard"
+  # kubeconform's JSON output lists only resources with findings; skipped
+  # kinds surface as statusError "could not find schema". Real external
+  # CRD-backed kinds we render are allowlisted below — anything else failing
+  # to resolve a schema is an apiVersion/kind typo.
+  local kc_external=(
+    "apiextensions.k8s.io/v1/CustomResourceDefinition"
+    "monitoring.coreos.com/v1/ServiceMonitor"
+    "monitoring.coreos.com/v1/PodMonitor"
+    "monitoring.coreos.com/v1/Prometheus"
+    "route.openshift.io/v1/Route"
+  )
+  local f
   for f in "$out"/*.yaml; do
     set +e
-    "$KUBECONFORM_BIN" -strict -ignore-missing-schemas -kubernetes-version 1.31.0 \
-      -output json "$f" > "$f.kc.json" 2>/dev/null
-    status=$?
+    "$KUBECONFORM_BIN" -strict -kubernetes-version 1.31.0 -output json "$f" > "$f.kc.json" 2>/dev/null
     set -e
-    if [ "$status" -ne 0 ] && ! grep -Eq 'statusInvalid|statusError' "$f.kc.json" 2>/dev/null; then
-      # kubeconform exits non-zero for skipped/missing schemas too; only
-      # statusInvalid/statusError are real failures — but empty output means
-      # the run itself broke, which must not pass silently.
-      if [ ! -s "$f.kc.json" ]; then
-        bad "kubeconform produced no output for $(basename "$f")"
-        issues=$((issues + 1))
-      fi
-    fi
-    if grep -Eq 'statusInvalid|statusError' "$f.kc.json" 2>/dev/null; then
-      bad "kubeconform violations in $(basename "$f"):"
-      $PYTHON_BIN -c 'import json,sys
-data=json.load(open(sys.argv[1]))
-for r in data.get("resources", []):
-    if r["status"] in ("statusInvalid","statusError"):
-        print(f"  {r[\"kind\"]} {r[\"name\"]}: {r[\"message\"]}")' "$f.kc.json"
+    if [ ! -s "$f.kc.json" ]; then
+      bad "kubeconform produced no output for $(basename "$f") (fail closed)"
       issues=$((issues + 1))
+      continue
     fi
-    bad_kinds=$($PYTHON_BIN -c 'import json,sys
-try:
-    data=json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)
-for r in data.get("resources", []):
-    if r["status"] == "statusSkipped":
-        v = r.get("version", "")
-        g = v.split("/")[0] if "/" in v else ""
-        if g == "" or g.endswith(".k8s.io") or g in ("apps","batch","policy","autoscaling","extensions"):
-            print(f"  {r[\"kind\"]} ({v})")' "$f.kc.json" 2>/dev/null || true)
-    if [ -n "$bad_kinds" ]; then
-      bad "$(basename "$f"): built-in kind(s) skipped — likely apiVersion/kind typo:"
-      echo "$bad_kinds"
+    if ! $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" kc-report "$f.kc.json" "${kc_external[@]}"; then
       issues=$((issues + 1))
     fi
   done
@@ -594,7 +596,7 @@ check_downstream_copies() {
       case "$src" in
         /*) continue ;;
       esac
-      if ! compgen -G "$context_dir/$src" >/dev/null; then
+      if ! glob_exists "$context_dir/$src"; then
         bad "$(basename "$kd"): COPY source '$src' does not exist in the upstream tree (an upstream reorg breaks the downstream build)"
         failures=$((failures + 1))
       fi
