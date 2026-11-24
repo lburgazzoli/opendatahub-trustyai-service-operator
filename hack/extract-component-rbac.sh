@@ -34,8 +34,9 @@ for controller_dir in "${DIRS[@]}"; do
         # Find all Go files with kubebuilder:rbac markers (with or without space).
         # Sort the file list: find returns entries in filesystem readdir order,
         # which varies across machines/filesystems, making the generated rule
-        # order (and therefore drift checks) machine-dependent.
-        find "${dir}" -name "*.go" | sort | xargs grep -h "// *+kubebuilder:rbac" 2>/dev/null || true
+        # order (and therefore drift checks) machine-dependent. NUL-delimited
+        # so paths containing spaces survive sorting and xargs.
+        find "${dir}" -name "*.go" -print0 | sort -z | xargs -0 grep -h "// *+kubebuilder:rbac" 2>/dev/null || true
     fi
 done | "${SCRIPT_DIR}/kubebuilder-rbac-to-yaml.sh" > "${TEMP_RULES}"
 

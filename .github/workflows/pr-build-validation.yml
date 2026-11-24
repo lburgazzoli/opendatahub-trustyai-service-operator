@@ -110,14 +110,28 @@ jobs:
     if: always()
     steps:
       - name: Fail closed
+        env:
+          # Expressions are passed via env (not interpolated into the run
+          # string) per zizmor's template-injection guidance.
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SHOULD_RUN: ${{ needs.changes.outputs.should_run }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
         run: |
           set -euo pipefail
-          if [ "${{ needs.changes.outputs.should_run }}" != "true" ]; then
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "FAIL: skip gate job did not succeed (result: '$CHANGES_RESULT') — treating as run-required"
+            exit 1
+          fi
+          if [ "$SHOULD_RUN" != "true" ] && [ "$SHOULD_RUN" != "false" ]; then
+            echo "FAIL: skip gate produced no should_run output ('$SHOULD_RUN')"
+            exit 1
+          fi
+          if [ "$SHOULD_RUN" = "false" ]; then
             echo "SKIP: no build-relevant paths changed"
             exit 0
           fi
-          if [ "${{ needs.validate.result }}" != "success" ]; then
-            echo "FAIL: build validation was required but result was '${{ needs.validate.result }}'"
+          if [ "$VALIDATE_RESULT" != "success" ]; then
+            echo "FAIL: build validation was required but result was '$VALIDATE_RESULT'"
             exit 1
           fi
           echo "OK: build validation passed"

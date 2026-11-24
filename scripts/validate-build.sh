@@ -62,6 +62,25 @@ log()  { printf '\n=== %s ===\n' "$*"; }
 ok()   { printf '✅ %s\n' "$*"; }
 bad()  { printf '❌ %s\n' "$*"; }
 
+# Download a release asset and verify it against a pinned SHA-256 before
+# extraction (CWE-494): a substituted release asset must never execute.
+# An empty expected digest fails closed — add a digest or set *_BIN.
+verified_download() {
+  local url="$1" asset="$2" expected="$3"
+  if [ -z "$expected" ]; then
+    bad "no pinned SHA-256 digest for $asset (add it to the digest table, or set the *_BIN override)"
+    return 1
+  fi
+  curl -fsSL -o "$WORKDIR/$asset" "$url" || { bad "download failed: $asset"; return 1; }
+  local actual
+  actual=$({ sha256sum "$WORKDIR/$asset" 2>/dev/null || shasum -a 256 "$WORKDIR/$asset"; } | cut -d' ' -f1)
+  if [ "$actual" != "$expected" ]; then
+    bad "$asset: SHA-256 mismatch (want $expected, got $actual) — refusing to extract"
+    return 1
+  fi
+  tar xzf "$WORKDIR/$asset" -C "$WORKDIR"
+}
+
 resolve_tools() {
   if [ -z "$KUSTOMIZE_BIN" ]; then
     if command -v kustomize >/dev/null 2>&1; then
@@ -75,8 +94,18 @@ resolve_tools() {
         Linux-arm64)  asset="kustomize_${KUSTOMIZE_VERSION}_linux_arm64.tar.gz" ;;
         *)            asset="kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" ;;
       esac
-      curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/${asset}" \
-        | tar xz -C "$WORKDIR"
+      # Pinned SHA-256 digests of the release assets (fail closed on any
+      # version without a pinned digest — set KUSTOMIZE_BIN to override).
+      case "$asset" in
+        kustomize_v5.7.0_darwin_arm64.tar.gz) digest=c0dac68dc7870e1f673ae4d8fb554df971e0b9b9f0affc4be4c0852f62d0796e ;;
+        kustomize_v5.7.0_darwin_amd64.tar.gz) digest=277a7401f969ce3945e8f0ff8b0cce6f4353854db1ff89ba070001e3246e7f22 ;;
+        kustomize_v5.7.0_linux_arm64.tar.gz)  digest=744bb1bc1854b6634dea9eaf6db2f401a734ed25d6837baa6f91157d79c27d5e ;;
+        kustomize_v5.7.0_linux_amd64.tar.gz)  digest=0d98f06d6d2c2c0ff8923cc136a517af74aaa187f1b9f3e17ff370d0625ede84 ;;
+        *)                                     digest="" ;;
+      esac
+      verified_download \
+        "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/${asset}" \
+        "$asset" "$digest" || exit 1
       KUSTOMIZE_BIN="$WORKDIR/kustomize"
     fi
   fi
@@ -92,8 +121,16 @@ resolve_tools() {
         Linux-arm64)  asset="kubeconform-linux-arm64.tar.gz" ;;
         *)            asset="kubeconform-linux-amd64.tar.gz" ;;
       esac
-      curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/${asset}" \
-        | tar xz -C "$WORKDIR"
+      case "$asset" in
+        kubeconform-darwin-arm64.tar.gz) digest=b5d32b2cb77f9c781c976b20a85e2d0bc8f9184d5d1cfe665a2f31a19f99eeb9 ;;
+        kubeconform-darwin-amd64.tar.gz) digest=c6771cc894d82e1b12f35ee797dcda1f7da6a3787aa30902a15c264056dd40d4 ;;
+        kubeconform-linux-arm64.tar.gz)  digest=cc907ccf9e3c34523f0f32b69745265e0a6908ca85b92f41931d4537860eb83c ;;
+        kubeconform-linux-amd64.tar.gz)  digest=c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3 ;;
+        *)                                digest="" ;;
+      esac
+      verified_download \
+        "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/${asset}" \
+        "$asset" "$digest" || exit 1
       KUBECONFORM_BIN="$WORKDIR/kubeconform"
     fi
   fi
@@ -195,20 +232,24 @@ check_dockerfile_copies() {
   echo "  checking $dockerfile"
   while IFS= read -r line; do
     [ -z "$line" ] && continue
+    # COPY --from=<stage> sources live in the source stage's filesystem,
+    # not the build context — context validation does not apply to them.
+    case "$line" in
+      *--from=*) continue ;;
+    esac
     # shellcheck disable=SC2206
     tokens=($line)
-    # drop COPY keyword and flags (--from=, --chown=, ...)
+    # drop COPY keyword and flags (--chown=, --chmod=, ...)
     local args=()
     for token in "${tokens[@]:1}"; do
       [[ "$token" == --* || "$token" == -* ]] && continue
       args+=("$token")
     done
     [ "${#args[@]}" -lt 2 ] && continue
-    # last token is the destination; sources may use dir-relative globs
+    # last token is the destination; sources may use dir-relative globs.
+    # A leading / in a plain COPY is still build-context-root relative.
     for src in "${args[@]:0:${#args[@]}-1}"; do
-      case "$src" in
-        /*) continue ;; # absolute path inside a stage
-      esac
+      src="${src#/}"
       if ! glob_exists "$context_dir/$src"; then
         bad "$dockerfile: COPY source '$src' does not exist in the build context"
         failures=$((failures + 1))
@@ -301,13 +342,24 @@ mode_manifests() {
   # Check for the var names kustomize actually substitutes; a bare '$(' grep
   # would false-positive on Kubernetes documentation text embedded in CRD
   # descriptions (env var expansion syntax).
+  # Capture the declared vars with a checked command: a failed yq inside a
+  # process substitution would silently yield no names and print a vacuous
+  # "all vars substituted".
+  local varlist
+  if ! varlist=$(yq -r '.vars[].name' "$REPO_ROOT/config/base/kustomization.yaml" 2>/dev/null); then
+    bad "vars check: cannot read declared vars from config/base/kustomization.yaml (yq failed) — refusing to pass vacuously"
+    issues=$((issues + 1))
+    varlist=""
+  elif [ -z "$varlist" ]; then
+    printf 'WARN: config/base/kustomization.yaml declares no vars; nothing to substitute-check\n'
+  fi
   while IFS= read -r varname; do
     [ -z "$varname" ] && continue
     hits=$(grep -lF "\$($varname)" "$out"/*.yaml 2>/dev/null || true)
     if [ -n "$hits" ]; then
       leftovers="$leftovers [$varname: $(echo "$hits" | xargs -n1 basename | tr '\n' ' ')]"
     fi
-  done < <(yq -r '.vars[].name' "$REPO_ROOT/config/base/kustomization.yaml" 2>/dev/null || true)
+  done <<<"$varlist"
   if [ -n "${leftovers// /}" ]; then
     bad "unresolved kustomize vars in renders:$leftovers"
     issues=$((issues + 1))
@@ -380,7 +432,7 @@ mode_manifests() {
     bad "manager --help produced no usage output; refusing to compare (fail closed)"
     issues=$((issues + 1))
   else
-    $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" manager-flags "$out"/odh.yaml "$out"/rhoai.yaml "$out"/module-operator.yaml \
+    $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" manager-flags "$out"/*.yaml \
       | sort -u > "$WORKDIR/used-flags.txt"
     $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" help-flags "$WORKDIR/help.txt" \
       | sort -u > "$WORKDIR/known-flags.txt"
@@ -497,6 +549,26 @@ mode_downstream() {
   fi
   local issues=0
 
+  # Fail closed: an empty or mis-shaped downstream checkout must not produce
+  # a vacuous "contract holds". The pinned ref defines the expected shape:
+  # the three konflux build targets (manager, driver, module).
+  local n_prs=0 pr
+  for pr in "$ds"/.tekton/*pull-request.yaml; do
+    [ -e "$pr" ] && n_prs=$((n_prs + 1))
+  done
+  if [ "$n_prs" -lt 3 ]; then
+    bad "downstream: expected at least 3 .tekton pull-request PipelineRuns (manager, driver, module) at the pinned ref, found $n_prs — refusing to pass vacuously"
+    exit 1
+  fi
+  local kd n_kd=0
+  for kd in "$ds"/Dockerfile.konflux "$ds"/Dockerfile.konflux.driver "$ds/$MODULE_CONTEXT/Dockerfile.konflux"; do
+    [ -f "$kd" ] && n_kd=$((n_kd + 1))
+  done
+  if [ "$n_kd" -ne 3 ]; then
+    bad "downstream: expected the 3 konflux Dockerfiles (manager, driver, module) at the pinned ref, found $n_kd — refusing to pass vacuously"
+    exit 1
+  fi
+
   log "downstream: .tekton PipelineRuns point at paths that exist"
   local pr dockerfile path_context prefetch
   for pr in "$ds"/.tekton/*pull-request.yaml; do
@@ -512,6 +584,17 @@ mode_downstream() {
       bad "$(basename "$pr"): path-context '$path_context' does not exist"
       issues=$((issues + 1))
     fi
+    # prefetch-input is a JSON array; to_json keeps each entry on one line so
+    # the line-oriented loop sees complete records. A parse failure on an
+    # existing param must not silently disable the check.
+    local prefetch_list=""
+    if yq -r '.spec.params[] | select(.name == "prefetch-input") | .value' "$pr" > "$WORKDIR/prefetch-$$.json" 2>/dev/null && [ -s "$WORKDIR/prefetch-$$.json" ]; then
+      if ! prefetch_list=$(yq -p json -r '.[] | to_json' "$WORKDIR/prefetch-$$.json" 2>/dev/null); then
+        bad "$(basename "$pr"): prefetch-input is present but not parseable"
+        issues=$((issues + 1))
+      fi
+    fi
+    rm -f "$WORKDIR/prefetch-$$.json"
     # every gomod prefetch path must have a go.mod
     while IFS= read -r prefetch; do
       [ -z "$prefetch" ] && continue
@@ -523,8 +606,7 @@ mode_downstream() {
         bad "$(basename "$pr"): gomod prefetch path '$path' has no go.mod"
         issues=$((issues + 1))
       fi
-    done < <(yq -r '.spec.params[] | select(.name == "prefetch-input") | .value' "$pr" | yq -p json -r '.[] | to_json' 2>/dev/null || \
-             yq -r '.spec.params[] | select(.name == "prefetch-input") | .value' "$pr" | yq -r '.' 2>/dev/null || true)
+    done <<<"$prefetch_list"
   done
 
   log "downstream: konflux Dockerfile COPY sources exist in this (upstream) tree"
@@ -553,8 +635,23 @@ mode_downstream() {
 
   log "downstream: module rpm prefetch covers the Dockerfile installs"
   local installed locked
-  installed=$(grep -oE 'microdnf install -y [a-zA-Z0-9@.-]+ [a-zA-Z0-9@.-]+' "$ds/$MODULE_CONTEXT/Dockerfile.konflux" 2>/dev/null \
-    | sed 's/microdnf install -y //' | tr ' ' '\n' | sort -u || true)
+  if [ ! -f "$ds/$MODULE_CONTEXT/.konflux/rpms.in.yaml" ]; then
+    bad "downstream: $MODULE_CONTEXT/.konflux/rpms.in.yaml not found at the pinned ref — cannot verify rpm prefetch"
+    exit 1
+  fi
+  # Join backslash-continued lines (portable awk joiner — BSD sed has no
+  # \n in s/// patterns), then capture EVERY package of each microdnf
+  # install command — the previous two-package regex let a third package
+  # escape the check.
+  installed=$(awk '
+      /\\$/ { sub(/\\$/, ""); buf = buf $0 " "; next }
+      { line = buf $0; gsub(/[ \t]+/, " ", line); print line; buf = "" }
+    ' "$ds/$MODULE_CONTEXT/Dockerfile.konflux" \
+    | grep -oE 'microdnf install -y [a-zA-Z0-9@._-]+( [a-zA-Z0-9@._-]+)*' \
+    | sed 's/^microdnf install -y //' | tr ' ' '\n' | sort -u || true)
+  if [ -z "$installed" ]; then
+    printf 'WARN: module Dockerfile installs no rpms; prefetch coverage is vacuous\n'
+  fi
   locked=$(yq -r '.reinstallPackages[]' "$ds/$MODULE_CONTEXT/.konflux/rpms.in.yaml" 2>/dev/null | sort -u || true)
   locked="$locked
 $(yq -r '.packages[]' "$ds/$MODULE_CONTEXT/.konflux/rpms.in.yaml" 2>/dev/null | sort -u || true)"
@@ -625,7 +722,20 @@ generate_into() {
 
 drifted_files() {
   local dir="$1"
-  (cd "$dir" && git diff --name-only HEAD -- 2>/dev/null) | sort -u || true
+  # Tracked changes AND new untracked artifacts: regeneration can also
+  # create files the PR forgot to commit, which git diff alone never lists.
+  (cd "$dir" && { git diff --name-only HEAD --; git ls-files --others --exclude-standard; } 2>/dev/null) | sort -u || true
+}
+
+# The regeneration delta of one file: the git diff for tracked files, the
+# full content for untracked ones (there is no committed baseline to diff).
+drift_delta() {
+  local dir="$1" f="$2"
+  if git -C "$dir" ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+    git -C "$dir" diff HEAD -- "$f"
+  else
+    cat "$dir/$f" 2>/dev/null || true
+  fi
 }
 
 mode_drift() {
@@ -647,20 +757,37 @@ mode_drift() {
   echo "$head_drift" | sed 's/^/  /'
 
   log "drift: comparing against $BASE_REF (warn while main is already stale)"
-  git -C "$REPO_ROOT" fetch --quiet origin "$(git -C "$REPO_ROOT" rev-parse --abbrev-ref "$BASE_REF" 2>/dev/null || echo main)" 2>/dev/null || true
+  # Refresh the tracking ref for the baseline branch so a stale local
+  # origin/main cannot grandfather drift that main has already fixed.
+  # NB: fetching "origin/main" as a source ref is a silent no-op — the
+  # remote advertises refs/heads/main, not refs/heads/origin/main.
+  local base_branch
+  base_branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref "$BASE_REF" 2>/dev/null || true)
+  base_branch="${base_branch#*/}"
+  [ -n "$base_branch" ] || base_branch=main
+  if ! git -C "$REPO_ROOT" fetch --quiet origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}" 2>/dev/null; then
+    printf 'WARN: cannot refresh origin/%s; the baseline may be stale\n' "$base_branch"
+  fi
   local base_commit
   base_commit=$(git -C "$REPO_ROOT" rev-parse --verify "$BASE_REF" 2>/dev/null || true)
   if [ -z "$base_commit" ]; then
-    printf 'WARN: cannot resolve BASE_REF %s; treating all drift as pre-existing\n' "$BASE_REF"
-    echo "WARN: HEAD carries generated-artifact drift (warn-only while main is stale)"
-    return 0
+    bad "drift: HEAD has generated-artifact drift and BASE_REF ${BASE_REF} cannot be resolved — no evidence the drift is pre-existing (set BASE_REF to a valid ref)"
+    exit 1
   fi
   local base_dir="$WORKDIR/base"
   mkdir -p "$base_dir"
   generate_into "$base_commit" "$base_dir" || exit 1
-  local base_drift new_drift
+  local base_drift new_drift f
   base_drift=$(drifted_files "$base_dir")
   new_drift=$(comm -23 <(echo "$head_drift") <(echo "$base_drift"))
+  # A file drifting on both sides is only pre-existing if it drifts the
+  # SAME way; a PR that changes how a file drifts is new drift.
+  for f in $(comm -12 <(echo "$head_drift") <(echo "$base_drift")); do
+    if ! diff -q <(drift_delta "$head_dir" "$f") <(drift_delta "$base_dir" "$f") >/dev/null 2>&1; then
+      new_drift="${new_drift:+$new_drift
+}$f"
+    fi
+  done
   if [ -n "$new_drift" ]; then
     bad "drift: this PR changes generated inputs without regenerating:"
     echo "$new_drift" | sed 's/^/  /'
