@@ -773,6 +773,12 @@ drift_is_preexisting() {
   # untracked at HEAD: no committed baseline to compare against — new drift
   git -C "$head_dir" ls-files --error-unmatch "$f" >/dev/null 2>&1 || return 1
   git -C "$head_dir" show "HEAD:$f" 2>/dev/null | cmp -s - <(git -C "$base_dir" show "HEAD:$f" 2>/dev/null) || return 1
+  # Identical deletions — both regenerations removed the file — are the
+  # same pre-existing drift (cmp on two absent paths would fail). One-sided
+  # absence still falls through to cmp and is classified as new drift.
+  if [ ! -e "$head_dir/$f" ] && [ ! -e "$base_dir/$f" ]; then
+    return 0
+  fi
   cmp -s "$head_dir/$f" "$base_dir/$f"
 }
 
