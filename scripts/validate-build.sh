@@ -424,28 +424,49 @@ mode_manifests() {
   done
 
   log "manifests: manager flag contract (overlay flags vs binary --help)"
-  local binary="$WORKDIR/manager"
-  (cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS="$(uname -s | tr '[:upper:]' '[:lower:]')" \
-    "$GO_BIN" build -buildvcs=false -o "$binary" ./cmd/main.go)
-  "$binary" --help > "$WORKDIR/help.txt" 2>&1 || true
-  if ! grep -q "Usage of" "$WORKDIR/help.txt"; then
-    bad "manager --help produced no usage output; refusing to compare (fail closed)"
-    issues=$((issues + 1))
-  else
-    $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" manager-flags "$out"/*.yaml \
-      | sort -u > "$WORKDIR/used-flags.txt"
-    $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" help-flags "$WORKDIR/help.txt" \
-      | sort -u > "$WORKDIR/known-flags.txt"
+  # Two different operators ship from this repo: the root manager
+  # (config/overlays/*) and the module operator (module-operator.yaml). Each
+  # render's flags must be validated against the binary that render actually
+  # deploys — the flag sets differ (only the root manager defines
+  # --enable-services/--configmap), so comparing a render against the wrong
+  # binary lets a flag the target rejects pass vacuously.
+  check_flags_against_binary() {
+    local binary="$1" label="$2"; shift 2
+    local helpfile="$WORKDIR/help-$label.txt"
+    "$binary" --help > "$helpfile" 2>&1 || true
+    if ! grep -q "Usage of" "$helpfile"; then
+      bad "$label: --help produced no usage output; refusing to compare (fail closed)"
+      return 1
+    fi
+    $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" manager-flags "$@" \
+      | sort -u > "$WORKDIR/used-$label.txt"
+    $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" help-flags "$helpfile" \
+      | sort -u > "$WORKDIR/known-$label.txt"
     local missing
-    missing=$(comm -23 "$WORKDIR/used-flags.txt" "$WORKDIR/known-flags.txt")
+    missing=$(comm -23 "$WORKDIR/used-$label.txt" "$WORKDIR/known-$label.txt")
     if [ -n "$missing" ]; then
-      bad "overlay passes flag(s) the manager binary does not define:"
+      bad "$label render passes flag(s) its binary does not define:"
       echo "$missing"
       bad "the container exits during flag parsing and never reconciles (RHOAIENG-100779 shape)"
-      issues=$((issues + 1))
-    else
-      ok "all overlay flags are defined by the binary"
+      return 1
     fi
+    ok "all $label render flags are defined by the $label binary"
+  }
+  local binary="$WORKDIR/manager"
+  (cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS="$(uname -s | tr '[:upper:]' '[:lower:]')" \
+    "$GO_BIN" build -buildvcs=false -o "$binary" ./cmd/main.go) || issues=$((issues + 1))
+  local module_binary="$WORKDIR/module-manager"
+  (cd "$REPO_ROOT/$MODULE_CONTEXT" && CGO_ENABLED=0 GOOS="$(uname -s | tr '[:upper:]' '[:lower:]')" \
+    "$GO_BIN" build -buildvcs=false -o "$module_binary" ./cmd/trustyai-operator-module) || issues=$((issues + 1))
+  if [ "$issues" -eq 0 ]; then
+    # root-manager renders: every overlay except the module operator's own
+    local root_renders=() r
+    for r in "$out"/*.yaml; do
+      [ "$(basename "$r")" = "module-operator.yaml" ] || root_renders+=("$r")
+    done
+    check_flags_against_binary "$binary" "manager" "${root_renders[@]}" || issues=$((issues + 1))
+    check_flags_against_binary "$module_binary" "module-operator" "$out/module-operator.yaml" \
+      || issues=$((issues + 1))
   fi
 
   if [ "$issues" -gt 0 ]; then
@@ -681,6 +702,11 @@ check_downstream_copies() {
   esac
   while IFS= read -r line; do
     [ -z "$line" ] && continue
+    # COPY --from=<stage> sources live in the source stage's filesystem,
+    # not the build context — context validation does not apply to them.
+    case "$line" in
+      *--from=*) continue ;;
+    esac
     # shellcheck disable=SC2206
     tokens=($line)
     local args=()
@@ -690,9 +716,7 @@ check_downstream_copies() {
     done
     [ "${#args[@]}" -lt 2 ] && continue
     for src in "${args[@]:0:${#args[@]}-1}"; do
-      case "$src" in
-        /*) continue ;;
-      esac
+      src="${src#/}"
       if ! glob_exists "$context_dir/$src"; then
         bad "$(basename "$kd"): COPY source '$src' does not exist in the upstream tree (an upstream reorg breaks the downstream build)"
         failures=$((failures + 1))
@@ -727,12 +751,16 @@ drifted_files() {
   (cd "$dir" && { git diff --name-only HEAD --; git ls-files --others --exclude-standard; } 2>/dev/null) | sort -u || true
 }
 
-# The regeneration delta of one file: the git diff for tracked files, the
-# full content for untracked ones (there is no committed baseline to diff).
+# The regeneration delta of one file, normalized: only the added/removed
+# content lines. Raw `git diff` output also carries blob IDs, hunk offsets
+# and context, so a legitimate committed change elsewhere in the same file
+# would make an otherwise identical regeneration delta compare as different.
+# For untracked files (no committed baseline to diff against) the delta is
+# the full content.
 drift_delta() {
   local dir="$1" f="$2"
   if git -C "$dir" ls-files --error-unmatch "$f" >/dev/null 2>&1; then
-    git -C "$dir" diff HEAD -- "$f"
+    git -C "$dir" diff HEAD -- "$f" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' || true
   else
     cat "$dir/$f" 2>/dev/null || true
   fi

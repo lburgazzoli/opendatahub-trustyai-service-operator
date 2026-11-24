@@ -36,7 +36,21 @@ for controller_dir in "${DIRS[@]}"; do
         # which varies across machines/filesystems, making the generated rule
         # order (and therefore drift checks) machine-dependent. NUL-delimited
         # so paths containing spaces survive sorting and xargs.
-        find "${dir}" -name "*.go" -print0 | sort -z | xargs -0 grep -h "// *+kubebuilder:rbac" 2>/dev/null || true
+        #
+        # find/sort failures must propagate (CWE-703): a blanket `|| true`
+        # would let a failed sort yield zero markers and silently emit
+        # 'rules: []'. Only grep's no-match exit (xargs status 123) is
+        # tolerated — a directory with no markers is a legitimate result.
+        rbacFileList=$(mktemp)
+        if ! find "${dir}" -name "*.go" -print0 | sort -z > "${rbacFileList}"; then
+            rm -f "${rbacFileList}"
+            echo "error: cannot enumerate Go files in ${dir}" >&2
+            exit 1
+        fi
+        if [ -s "${rbacFileList}" ]; then
+            xargs -0 grep -h "// *+kubebuilder:rbac" < "${rbacFileList}" 2>/dev/null || true
+        fi
+        rm -f "${rbacFileList}"
     fi
 done | "${SCRIPT_DIR}/kubebuilder-rbac-to-yaml.sh" > "${TEMP_RULES}"
 
