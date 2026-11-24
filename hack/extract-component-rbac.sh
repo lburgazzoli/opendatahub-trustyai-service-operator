@@ -35,21 +35,29 @@ for controller_dir in "${DIRS[@]}"; do
         # Sort the file list: find returns entries in filesystem readdir order,
         # which varies across machines/filesystems, making the generated rule
         # order (and therefore drift checks) machine-dependent. NUL-delimited
-        # so paths containing spaces survive sorting and xargs.
+        # so paths containing spaces survive sorting.
         #
-        # find/sort failures must propagate (CWE-703): a blanket `|| true`
-        # would let a failed sort yield zero markers and silently emit
-        # 'rules: []'. Only grep's no-match exit (xargs status 123) is
-        # tolerated — a directory with no markers is a legitimate result.
+        # Failures in find/sort/grep must propagate (CWE-703): a blanket
+        # `|| true` (or xargs, which flattens both grep's no-match status 1
+        # and its error status 2 into 123) would let a failed scan yield
+        # zero markers and silently emit 'rules: []'. grep runs per file so
+        # no-match (1) — a legitimate result — stays tolerated while real
+        # errors abort; stderr is kept for diagnostics.
         rbacFileList=$(mktemp)
         if ! find "${dir}" -name "*.go" -print0 | sort -z > "${rbacFileList}"; then
             rm -f "${rbacFileList}"
             echo "error: cannot enumerate Go files in ${dir}" >&2
             exit 1
         fi
-        if [ -s "${rbacFileList}" ]; then
-            xargs -0 grep -h "// *+kubebuilder:rbac" < "${rbacFileList}" 2>/dev/null || true
-        fi
+        while IFS= read -r -d '' gofile; do
+            rc=0
+            grep -h "// *+kubebuilder:rbac" "${gofile}" || rc=$?
+            if [ "${rc}" -gt 1 ]; then
+                rm -f "${rbacFileList}"
+                echo "error: cannot scan ${gofile} for rbac markers (grep status ${rc})" >&2
+                exit 1
+            fi
+        done < "${rbacFileList}"
         rm -f "${rbacFileList}"
     fi
 done | "${SCRIPT_DIR}/kubebuilder-rbac-to-yaml.sh" > "${TEMP_RULES}"

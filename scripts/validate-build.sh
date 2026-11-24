@@ -438,10 +438,19 @@ mode_manifests() {
       bad "$label: --help produced no usage output; refusing to compare (fail closed)"
       return 1
     fi
-    $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" manager-flags "$@" \
-      | sort -u > "$WORKDIR/used-$label.txt"
-    $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" help-flags "$helpfile" \
-      | sort -u > "$WORKDIR/known-$label.txt"
+    # Fail closed: if flag extraction fails before printing anything, the
+    # used-flags file would be empty, comm would find nothing missing, and
+    # the check would pass vacuously.
+    if ! $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" manager-flags "$@" \
+      | sort -u > "$WORKDIR/used-$label.txt"; then
+      bad "$label: manager-flags extraction failed; refusing to compare (fail closed)"
+      return 1
+    fi
+    if ! $PYTHON_BIN "$REPO_ROOT/scripts/manifest_contract.py" help-flags "$helpfile" \
+      | sort -u > "$WORKDIR/known-$label.txt"; then
+      bad "$label: help-flags extraction failed; refusing to compare (fail closed)"
+      return 1
+    fi
     local missing
     missing=$(comm -23 "$WORKDIR/used-$label.txt" "$WORKDIR/known-$label.txt")
     if [ -n "$missing" ]; then
@@ -751,19 +760,20 @@ drifted_files() {
   (cd "$dir" && { git diff --name-only HEAD --; git ls-files --others --exclude-standard; } 2>/dev/null) | sort -u || true
 }
 
-# The regeneration delta of one file, normalized: only the added/removed
-# content lines. Raw `git diff` output also carries blob IDs, hunk offsets
-# and context, so a legitimate committed change elsewhere in the same file
-# would make an otherwise identical regeneration delta compare as different.
-# For untracked files (no committed baseline to diff against) the delta is
-# the full content.
-drift_delta() {
-  local dir="$1" f="$2"
-  if git -C "$dir" ls-files --error-unmatch "$f" >/dev/null 2>&1; then
-    git -C "$dir" diff HEAD -- "$f" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' || true
-  else
-    cat "$dir/$f" 2>/dev/null || true
-  fi
+# Whether a file drifting on both HEAD and the baseline is only the
+# pre-existing baseline drift: the committed artifact AND its regeneration
+# must both be identical on the two sides — the regeneration delta is then
+# necessarily the same. Comparing the two contents directly (instead of
+# diffing diffs) keeps full rule/field identity: normalized +/- line lists
+# lose it, so the same added verb in a different RBAC rule would compare as
+# the same drift. It also sidesteps git diff's blob IDs, hunk offsets and
+# context, which pick up unrelated committed changes.
+drift_is_preexisting() {
+  local head_dir="$1" base_dir="$2" f="$3"
+  # untracked at HEAD: no committed baseline to compare against — new drift
+  git -C "$head_dir" ls-files --error-unmatch "$f" >/dev/null 2>&1 || return 1
+  git -C "$head_dir" show "HEAD:$f" 2>/dev/null | cmp -s - <(git -C "$base_dir" show "HEAD:$f" 2>/dev/null) || return 1
+  cmp -s "$head_dir/$f" "$base_dir/$f"
 }
 
 mode_drift() {
@@ -808,10 +818,12 @@ mode_drift() {
   local base_drift new_drift f
   base_drift=$(drifted_files "$base_dir")
   new_drift=$(comm -23 <(echo "$head_drift") <(echo "$base_drift"))
-  # A file drifting on both sides is only pre-existing if it drifts the
-  # SAME way; a PR that changes how a file drifts is new drift.
+  # A file drifting on both sides is only pre-existing if both the committed
+  # artifact and its regeneration are identical on the two sides; a PR that
+  # changes how a file drifts (or hand-edits a drifting artifact) is new
+  # drift.
   for f in $(comm -12 <(echo "$head_drift") <(echo "$base_drift")); do
-    if ! diff -q <(drift_delta "$head_dir" "$f") <(drift_delta "$base_dir" "$f") >/dev/null 2>&1; then
+    if ! drift_is_preexisting "$head_dir" "$base_dir" "$f"; then
       new_drift="${new_drift:+$new_drift
 }$f"
     fi
