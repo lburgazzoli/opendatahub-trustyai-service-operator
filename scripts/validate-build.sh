@@ -166,7 +166,7 @@ mode_static() {
   declared=$(yq -r '.vars[].name' "$REPO_ROOT/config/base/kustomization.yaml" | sort -u)
   defined=$(grep -oE '^[a-zA-Z0-9_-]+=' "$REPO_ROOT/config/base/params.env" | tr -d '=' | sort -u)
   for ref in $declared; do
-    if ! grep -qx "$ref" <<<"$defined"; then
+    if ! grep -Fqx -- "$ref" <<<"$defined"; then
       bad "var '$ref' is declared in config/base/kustomization.yaml but config/base/params.env does not define it"
       issues=$((issues + 1))
     fi
@@ -232,19 +232,20 @@ check_dockerfile_copies() {
   echo "  checking $dockerfile"
   while IFS= read -r line; do
     [ -z "$line" ] && continue
-    # COPY --from=<stage> sources live in the source stage's filesystem,
-    # not the build context — context validation does not apply to them.
-    case "$line" in
-      *--from=*) continue ;;
-    esac
     # shellcheck disable=SC2206
     tokens=($line)
-    # drop COPY keyword and flags (--chown=, --chmod=, ...)
-    local args=()
+    # drop COPY keyword and flags (--chown=, --chmod=, ...). A --from flag
+    # means the sources live in the source stage's filesystem, not the
+    # build context — context validation does not apply to them. The flag
+    # is matched at token level: a substring match on the whole line would
+    # also skip sources whose names merely contain "--from=".
+    local args=() has_from=0
     for token in "${tokens[@]:1}"; do
+      [[ "$token" == --from=* ]] && has_from=1
       [[ "$token" == --* || "$token" == -* ]] && continue
       args+=("$token")
     done
+    [ "$has_from" -eq 1 ] && continue
     [ "${#args[@]}" -lt 2 ] && continue
     # last token is the destination; sources may use dir-relative globs.
     # A leading / in a plain COPY is still build-context-root relative.
@@ -345,11 +346,12 @@ mode_manifests() {
   # Capture the declared vars with a checked command: a failed yq inside a
   # process substitution would silently yield no names and print a vacuous
   # "all vars substituted".
-  local varlist
+  local varlist vars_scan_failed=0
   if ! varlist=$(yq -r '.vars[].name' "$REPO_ROOT/config/base/kustomization.yaml" 2>/dev/null); then
     bad "vars check: cannot read declared vars from config/base/kustomization.yaml (yq failed) — refusing to pass vacuously"
     issues=$((issues + 1))
     varlist=""
+    vars_scan_failed=1
   elif [ -z "$varlist" ]; then
     printf 'WARN: config/base/kustomization.yaml declares no vars; nothing to substitute-check\n'
   fi
@@ -363,7 +365,7 @@ mode_manifests() {
   if [ -n "${leftovers// /}" ]; then
     bad "unresolved kustomize vars in renders:$leftovers"
     issues=$((issues + 1))
-  else
+  elif [ "$vars_scan_failed" -eq 0 ]; then
     ok "all vars substituted"
   fi
 
@@ -590,6 +592,23 @@ mode_downstream() {
     bad "downstream: expected at least 3 .tekton pull-request PipelineRuns (manager, driver, module) at the pinned ref, found $n_prs — refusing to pass vacuously"
     exit 1
   fi
+  # Counting PipelineRuns is not enough: they could all build the same
+  # target. Each of the three (path-context, dockerfile) build targets must
+  # be referenced by at least one PipelineRun (exact line match).
+  local pr_targets=""
+  for pr in "$ds"/.tekton/*pull-request.yaml; do
+    [ -e "$pr" ] || continue
+    pr_targets+=$(yq -r '[.spec.params[] | select(.name == "path-context") | .value] + [.spec.params[] | select(.name == "dockerfile") | .value] | @tsv' "$pr" 2>/dev/null || true)$'\n'
+  done
+  local target
+  # NB: the \t separators must be real tabs — printf, not "\t" in double
+  # quotes (which bash leaves as a literal backslash-t).
+  for target in "$(printf '.\tDockerfile.konflux')" "$(printf '.\tDockerfile.konflux.driver')" "$(printf './%s/\tDockerfile.konflux' "$MODULE_CONTEXT")"; do
+    if ! grep -Fxq -- "$target" <<<"$pr_targets"; then
+      bad "downstream: no PipelineRun builds target '$(echo "$target" | tr '\t' ' ')' at the pinned ref — refusing to pass vacuously"
+      exit 1
+    fi
+  done
   local kd n_kd=0
   for kd in "$ds"/Dockerfile.konflux "$ds"/Dockerfile.konflux.driver "$ds/$MODULE_CONTEXT/Dockerfile.konflux"; do
     [ -f "$kd" ] && n_kd=$((n_kd + 1))
@@ -614,29 +633,28 @@ mode_downstream() {
       bad "$(basename "$pr"): path-context '$path_context' does not exist"
       issues=$((issues + 1))
     fi
-    # prefetch-input is a JSON array; to_json keeps each entry on one line so
-    # the line-oriented loop sees complete records. A parse failure on an
-    # existing param must not silently disable the check.
-    local prefetch_list=""
+    # prefetch-input is a JSON array. The gomod paths are extracted with a
+    # single yq pass — never re-encoded with to_json and split by lines:
+    # yq >= 4.53 pretty-prints to_json, which silently turned this check
+    # into a no-op (each JSON fragment failed the .type lookup and was
+    # skipped). A parse failure on an existing param is reported instead
+    # of silently disabling the check.
+    local gomod_paths=""
     if yq -r '.spec.params[] | select(.name == "prefetch-input") | .value' "$pr" > "$WORKDIR/prefetch-$$.json" 2>/dev/null && [ -s "$WORKDIR/prefetch-$$.json" ]; then
-      if ! prefetch_list=$(yq -p json -r '.[] | to_json' "$WORKDIR/prefetch-$$.json" 2>/dev/null); then
+      if ! gomod_paths=$(yq -p json -r '.[] | select(.type == "gomod") | .path // ""' "$WORKDIR/prefetch-$$.json" 2>/dev/null); then
         bad "$(basename "$pr"): prefetch-input is present but not parseable"
         issues=$((issues + 1))
       fi
     fi
     rm -f "$WORKDIR/prefetch-$$.json"
     # every gomod prefetch path must have a go.mod
-    while IFS= read -r prefetch; do
-      [ -z "$prefetch" ] && continue
-      local type path
-      type=$(yq -r '.type' <<<"$prefetch" 2>/dev/null || echo "")
-      path=$(yq -r '.path // ""' <<<"$prefetch" 2>/dev/null || echo "")
-      [ "$type" != "gomod" ] && continue
+    while IFS= read -r path; do
+      [ -z "$path" ] || [ "$path" = "null" ] && continue
       if [ ! -f "$ds/$path/go.mod" ]; then
         bad "$(basename "$pr"): gomod prefetch path '$path' has no go.mod"
         issues=$((issues + 1))
       fi
-    done <<<"$prefetch_list"
+    done <<<"$gomod_paths"
   done
 
   log "downstream: konflux Dockerfile COPY sources exist in this (upstream) tree"
@@ -687,7 +705,7 @@ mode_downstream() {
 $(yq -r '.packages[]' "$ds/$MODULE_CONTEXT/.konflux/rpms.in.yaml" 2>/dev/null | sort -u || true)"
   local pkg
   for pkg in $installed; do
-    if ! grep -qx "$pkg" <<<"$locked"; then
+    if ! grep -Fqx -- "$pkg" <<<"$locked"; then
       bad "module Dockerfile installs rpm '$pkg' but .konflux/rpms.in.yaml does not prefetch it (hermetic build will fail)"
       issues=$((issues + 1))
     fi
@@ -711,18 +729,18 @@ check_downstream_copies() {
   esac
   while IFS= read -r line; do
     [ -z "$line" ] && continue
-    # COPY --from=<stage> sources live in the source stage's filesystem,
-    # not the build context — context validation does not apply to them.
-    case "$line" in
-      *--from=*) continue ;;
-    esac
     # shellcheck disable=SC2206
     tokens=($line)
-    local args=()
+    # drop COPY keyword and flags; a --from flag means the sources live in
+    # the source stage's filesystem, not the build context. Matched at token
+    # level so source names containing "--from=" stay validated.
+    local args=() has_from=0
     for token in "${tokens[@]:1}"; do
+      [[ "$token" == --from=* ]] && has_from=1
       [[ "$token" == --* || "$token" == -* ]] && continue
       args+=("$token")
     done
+    [ "$has_from" -eq 1 ] && continue
     [ "${#args[@]}" -lt 2 ] && continue
     for src in "${args[@]:0:${#args[@]}-1}"; do
       src="${src#/}"
@@ -772,6 +790,11 @@ drift_is_preexisting() {
   local head_dir="$1" base_dir="$2" f="$3"
   # untracked at HEAD: no committed baseline to compare against — new drift
   git -C "$head_dir" ls-files --error-unmatch "$f" >/dev/null 2>&1 || return 1
+  # untracked at the baseline while tracked at HEAD: the PR newly tracks a
+  # path the baseline only ever regenerated. Without this check, git show's
+  # failure inside the process substitution below would surface as empty
+  # output and compare equal to an empty committed file.
+  git -C "$base_dir" ls-files --error-unmatch "$f" >/dev/null 2>&1 || return 1
   git -C "$head_dir" show "HEAD:$f" 2>/dev/null | cmp -s - <(git -C "$base_dir" show "HEAD:$f" 2>/dev/null) || return 1
   # Identical deletions — both regenerations removed the file — are the
   # same pre-existing drift (cmp on two absent paths would fail). One-sided
@@ -810,7 +833,8 @@ mode_drift() {
   base_branch="${base_branch#*/}"
   [ -n "$base_branch" ] || base_branch=main
   if ! git -C "$REPO_ROOT" fetch --quiet origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}" 2>/dev/null; then
-    printf 'WARN: cannot refresh origin/%s; the baseline may be stale\n' "$base_branch"
+    bad "drift: cannot refresh origin/${base_branch} to verify the baseline — continuing would classify this drift against a possibly stale baseline (fix network/remote access, or point BASE_REF at a ref you know is current)"
+    exit 1
   fi
   local base_commit
   base_commit=$(git -C "$REPO_ROOT" rev-parse --verify "$BASE_REF" 2>/dev/null || true)

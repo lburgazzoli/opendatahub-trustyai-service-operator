@@ -35,7 +35,9 @@ for controller_dir in "${DIRS[@]}"; do
         # Sort the file list: find returns entries in filesystem readdir order,
         # which varies across machines/filesystems, making the generated rule
         # order (and therefore drift checks) machine-dependent. NUL-delimited
-        # so paths containing spaces survive sorting.
+        # so paths containing spaces survive sorting. LC_ALL=C pins the
+        # collation: under other locales the sort order itself varies by
+        # machine, reintroducing the nondeterminism the sort exists to remove.
         #
         # Failures in find/sort/grep must propagate (CWE-703): a blanket
         # `|| true` (or xargs, which flattens both grep's no-match status 1
@@ -44,7 +46,7 @@ for controller_dir in "${DIRS[@]}"; do
         # no-match (1) — a legitimate result — stays tolerated while real
         # errors abort; stderr is kept for diagnostics.
         rbacFileList=$(mktemp)
-        if ! find "${dir}" -name "*.go" -print0 | sort -z > "${rbacFileList}"; then
+        if ! find "${dir}" -name "*.go" -print0 | LC_ALL=C sort -z > "${rbacFileList}"; then
             rm -f "${rbacFileList}"
             echo "error: cannot enumerate Go files in ${dir}" >&2
             exit 1
